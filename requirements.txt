@@ -1,0 +1,9 @@
+google-cloud-storage
+transformers
+torch
+scikit-learn
+python-dotenv
+accelerate
+fastapi
+uvicorn
+httpx

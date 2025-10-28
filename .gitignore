@@ -1,0 +1,66 @@
+# OS e IDE
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+._*
+.vscode/
+.idea/
+
+# Python geral
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.dylib
+*.egg-info/
+.python-version
+
+# Ambientes virtuais
+venv/
+.venv/
+env/
+
+# Logs e artefatos
+logs/
+artifacts/**
+!artifacts/.gitkeep
+
+# Modelos e checkpoints
+models/**
+!models/.gitkeep
+
+# Dados locais e datasets grandes
+data/**
+!data/.gitkeep
+dataset*.jsonl
+*.parquet
+*.csv
+*.tsv
+
+# Cache e ferramentas
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.cache/
+.ipynb_checkpoints/
+
+# Cobertura
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Env/segredos
+.env
+.env.*
+.secrets
+
+# Build/Distribuição
+dist/
+build/
+*.whl
+*.tar.gz
+
