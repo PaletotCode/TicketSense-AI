@@ -1,78 +1,130 @@
-# PingFy_IA
+# TicketSense-AI
 
-Pipeline modular de classificação de intenções para a plataforma PingFy.
+TicketSense-AI é o módulo de inteligência que classifica automaticamente as intenções que chegam pelos canais de atendimento digital da empresa. Ele lê conversas, identifica o motivo do contato (ex.: pagamento, cancelamento, suporte) e entrega essa resposta para o ecossistema PingFy (futuramente) com rapidez e rastreabilidade.
 
-## Estrutura
+## Por que este módulo existe
+- Padronizar a triagem de tickets e conversas, reduzindo tempo de atendimento humano.
+- Garantir histórico fiel de métricas de intenção para relatórios e alertas.
+- Permitir que a equipe utilize um modelo treinável e auditável, sem depender de serviços externos.
 
+## Como o projeto está organizado
 ```
 pingfy_ia/
-├── api/               # API FastAPI de inferência
-├── config/            # Configurações centralizadas
-├── trainer/           # Utilitários e pipeline de treinamento
-├── scripts/           # Ferramentas auxiliares (prep. dataset)
-├── artifacts/         # Checkpoints, best_model e logs gerados
-└── data/              # Dataset local (copiado ou baixado)
+├── api/             → API FastAPI que expõe as previsões do modelo.
+├── config/          → Configurações compartilhadas (device, GCS, API, treino).
+├── trainer/         → Pipeline completo de treinamento e utilidades.
+├── scripts/         → Ferramentas rápidas para cuidar do dataset.
+├── artifacts/       → Modelos treinados, checkpoints e logs gerados.
+├── data/            → Cópia local do dataset validado (não versionado).
+├── models/          → Espaço para exportações extras do modelo.
+├── requirements.txt → Dependências Python.
+└── README.md        → Este guia.
 ```
 
-## Como treinar (Mac M4 com MPS)
+### O que cada parte faz
+- `api/inference.py`: carrega o melhor modelo disponível e disponibiliza os endpoints `/predict_intent`, `/predict_batch`, `/health` e `/model_info`.
+- `api/schemas.py`: define os formatos de entrada e saída da API, para facilitar integrações.
+- `config/config.py`: concentra todas as configurações (como diretórios, credenciais e device) em dataclasses simples.
+- `trainer/train.py`: guia principal do treinamento; prepara dados, ajusta o modelo base (DistilBERT), calcula métricas e salva artefatos.
+- `trainer/dataset_utils.py`: valida o dataset, cuida dos splits, faz encode das intenções e fornece o `Dataset` usado no treino.
+- `trainer/model_utils.py`: cria o modelo/tokenizer, mantém o arquivo `label_map.json` e envia resultados para o Google Cloud Storage, se credenciais estiverem configuradas.
+- `scripts/format_dataset.py`: corrige arquivos JSONL gerados por IA, garantindo um item por linha.
+- `scripts/prepare_dataset.py`: valida o dataset, mostra estatísticas de distribuição e, opcionalmente, envia o arquivo para o GCS.
+
+## Fluxo de trabalho recomendado
+1. **Organize o dataset** com conversas rotuladas em JSONL (um registro por linha).
+2. **Formate e valide** o arquivo usando os scripts de apoio.
+3. **Treine o modelo** com `python -m trainer.train` para gerar novos artefatos em `artifacts/`.
+4. **Suba a API** com o modelo mais recente e integre com o restante da plataforma.
+
+## Preparação do ambiente
+- Pré-requisitos: Python 3.10+, `pip`, acesso opcional ao Google Cloud Storage (caso use upload automático).
+- Sugestão para criar o ambiente virtual:
 
 ```bash
-source venv/bin/activate
-python -m trainer.train
+python -m venv venv
+source venv/bin/activate  # Windows: .\venv\Scripts\activate
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-Os artefatos finais ficarão em `artifacts/best_model/`. Logs estão em `artifacts/logs/`.
+## Comandos rápidos
+- **Aplicar formatação no dataset bruto**
+  ```bash
+  python scripts/format_dataset.py --input dataset.jsonl --output dataset_tmp.jsonl
+  mv dataset_tmp.jsonl dataset.jsonl
+  ```
 
-## Como rodar a API localmente
+- **Validar dataset, gerar estatísticas e copiar para `data/`**
+  ```bash
+  python scripts/prepare_dataset.py
+  ```
 
-```bash
-source venv/bin/activate
-uvicorn api.inference:app --reload --port 8000
+- **Enviar dataset validado para o Google Cloud Storage** (requer credencial configurada)
+  ```bash
+  python scripts/prepare_dataset.py --upload
+  ```
+
+- **Rodar o treinamento completo**
+  ```bash
+  python -m trainer.train
+  ```
+
+- **Iniciar a API de inferência no modo desenvolvimento**
+  ```bash
+  uvicorn api.inference:app --reload --port 8000
+  ```
+
+- **Consultar manualmente a API (exemplo)**
+  ```bash
+  curl -X POST http://localhost:8000/predict_intent \
+       -H "Content-Type: application/json" \
+       -d '{"text": "Olá, preciso renegociar minha fatura"}'
+  ```
+
+## API de inferência
+- `POST /predict_intent`: recebe um texto e devolve a intenção mais provável com a confiança.
+- `POST /predict_batch`: aceita uma lista de textos para classificação em lote.
+- `GET /health`: informa se o modelo está carregado e em qual device está rodando.
+- `GET /model_info`: descreve o modelo ativo, classes conhecidas e tamanho máximo das mensagens.
+
+## Scripts auxiliares
+- `format_dataset.py`: usado logo após receber um JSON bruto vindo de uma geração automática. Ele garante que cada item estará em uma linha e pronto para ser lido pelo restante do pipeline.
+- `prepare_dataset.py`: confirma que o arquivo está válido, exibe total de mensagens por intenção e copia para `data/`. Com a flag `--upload`, realiza o envio para o bucket definido em `config/config.py`.
+
+## Configuração por ambiente
+Use um arquivo `.env` na raiz (não versionado) para guardar:
+
+```
+GCS_BUCKET_NAME=nome-do-bucket
+GCS_DATASET_PATH=data/conversations.jsonl
+GCS_MODEL_PATH=models/checkpoints/distilbert-intents
+GOOGLE_APPLICATION_CREDENTIALS=/caminho/para/credencial.json
+API_HOST=0.0.0.0
+API_PORT=8000
+API_RELOAD=false
 ```
 
-## Ferramentas de dataset
+Se nenhuma variável for definida, o projeto usa os valores padrão presentes em `config/config.py`.
 
-### 1. Corrigir JSONL gerado por IA
+## Formato esperado do dataset
+- Arquivo `.jsonl`, com uma conversa por linha.
+- Cada conversa contém uma lista `messages`, e o script consome apenas itens onde `role` é `"user"`.
+- A intenção deve estar na chave `intent`. Pode ser uma lista com mais de um rótulo (multi-intenção).
 
-```bash
-python scripts/format_dataset.py --input dataset.jsonl --output dataset_tmp.jsonl
-mv dataset_tmp.jsonl dataset.jsonl
+Exemplo:
+
+```jsonl
+{"conversation_id": "conv_001", "channel": "whatsapp", "messages": [
+  {"role": "user", "text": "Oi, preciso da segunda via do boleto", "intent": ["PAYMENT"]},
+  {"role": "agent", "text": "Claro, já envio o link."}
+]}
 ```
 
-### 2. Validar e gerar estatísticas
+## Artefatos gerados
+- `artifacts/best_model/`: contém o modelo final, tokenizer e arquivo `label_map.json` com o dicionário das intenções.
+- `artifacts/checkpoints/`: guarda os checkpoints intermediários do treinamento.
+- `artifacts/logs/training.log`: registra cada execução de treino para auditoria.
+- `models/`: espaço reservado para exportações adicionais (ex.: TorchScript, ONNX) caso o time precise.
 
-```bash
-python scripts/prepare_dataset.py
-```
-
-### 3. Enviar para o GCS (opcional, requer credenciais)
-
-```bash
-python scripts/prepare_dataset.py --upload
-```
-
-### 4. Manual de preparação do dataset 
-
-# 1) Ative a venv, se ainda não estiver ativa
-source venv/bin/activate
-
-# 2) Formate o arquivo gerado pela IA (saída em dataset_tmp.jsonl)
-python scripts/format_dataset.py --input dataset.jsonl --output dataset_tmp.jsonl
-
-# 3) Substitua o arquivo antigo pelo formatado
-mv dataset_tmp.jsonl dataset.jsonl
-
-# 4) Rode a validação/estatísticas
-python scripts/prepare_dataset.py
-
-# 5) (Opcional) Faça upload para o GCS quando quiser publicar
-python scripts/prepare_dataset.py --upload
-
-### 5. Resultado da execução do script de preparo do dataset será algo como:
-🚀 Using device: mps
-2025-10-28 12:28:32,160 - trainer.dataset_utils - INFO - 📁 Usando dataset local em data/conversations.jsonl
-2025-10-28 12:28:32,161 - dataset-prep - INFO - 📄 Dataset validado em /Users/pedro.torres/Documents/projects/pingfy_ia/data/conversations.jsonl
-2025-10-28 12:28:32,161 - dataset-prep - INFO - 📝 Mensagens de usuário: 194
-2025-10-28 12:28:32,161 - dataset-prep - INFO - 🏷️  Intents únicas: 6
-2025-10-28 12:28:32,161 - dataset-prep - INFO - 🏷️  Distribuição das intents: {'GREETING': 16, 'LEAD_INTENT': 51, 'PAYMENT': 48, 'SUPPORT': 61, 'CANCELATION': 23, 'FOLLOW_UP': 12}
-## A idéia é que haja uma distruibuição/quantidade ampla de intents que vão ser utilizadas para alimentar as estatísticas finais ao usuário.
+Licença: consulte `LICENSE.txt` (Business Source License 1.1). Para uso comercial em produção, é necessário acordo com PaletotCode.
