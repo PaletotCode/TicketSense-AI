@@ -9,4 +9,4 @@ uvicorn
 httpx
 openai>=1.0.0
 tqdm>=4.65.0
-google-generativeai>=0.3.0  # Opcional: apenas se for usar Gemini
+google-generativeai
