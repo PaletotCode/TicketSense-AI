@@ -81,7 +81,12 @@ pip install -r requirements.txt
        -H "Content-Type: application/json" \
        -d '{"text": "Olá, preciso renegociar minha fatura"}'
   ```
-
+- **Para conseguir ver todas as probabilidades de intenção, adicione o parâmetro "return_probabilities": true no final**
+  ```bash
+  curl -X POST http://localhost:8000/predict_intent \
+     -H "Content-Type: application/json" \
+     -d '{"text": "Tenho cobrança duplicada e quero saber como faço para resolver isso.", "return_probabilities": true}'
+  ```
 ## API de inferência
 - `POST /predict_intent`: recebe um texto e devolve a intenção mais provável com a confiança.
 - `POST /predict_batch`: aceita uma lista de textos para classificação em lote.
