@@ -1,10 +1,3 @@
-"""
-Utilitários de dataset para o pipeline de treinamento do PingFy_IA.
-
-Responsável por localizar, validar e preparar o dataset, além de prover
-estratégias de split e o wrapper Dataset consumido pelo Trainer.
-"""
-
 from __future__ import annotations
 
 import json
@@ -21,48 +14,27 @@ import torch
 
 try:
     from google.cloud import storage  # type: ignore
-except ImportError:  # pragma: no cover - dependência opcional
+except ImportError:  # pragma: no cover
     storage = None  # type: ignore
 
 LOGGER = logging.getLogger(__name__)
 
 
-def ensure_dataset(
-    gcs_config,
-    training_config,
-    dataset_override: str | None = None,
-) -> Path:
-    """Garante que o dataset esteja disponível localmente.
-
-    Args:
-        gcs_config: Configurações de GCS.
-        training_config: Configurações de treinamento.
-        dataset_override: Caminho absoluto opcional para uso explícito.
-
-    Returns:
-        Path: Caminho para o dataset em JSONL.
-
-    Raises:
-        FileNotFoundError: Quando o dataset não é encontrado.
-        RuntimeError: Quando gcs_config é necessário mas google-cloud-storage não está instalado.
-    """
-    # 1) Caminho explicitamente informado via parâmetro ou variável de ambiente
-    explicit_path = dataset_override or os.getenv("LOCAL_DATASET_PATH")
-    if explicit_path:
-        candidate = Path(explicit_path).expanduser().resolve()
+def ensure_dataset(gcs_config, training_config, dataset_override: str | None = None) -> Path:
+    explicit = dataset_override or os.getenv("LOCAL_DATASET_PATH")
+    if explicit:
+        candidate = Path(explicit).expanduser().resolve()
         if candidate.exists():
             LOGGER.info("📁 Usando dataset informado em %s", candidate)
             return candidate
         raise FileNotFoundError(f"Dataset indicado não encontrado: {candidate}")
 
-    # 2) Diretório local configurado (artifacts/data)
     inferred_name = Path(gcs_config.dataset_path).name or "dataset.jsonl"
     local_dataset = training_config.local_data_dir / inferred_name
     if local_dataset.exists():
         LOGGER.info("📁 Usando dataset local em %s", local_dataset)
         return local_dataset.resolve()
 
-    # 3) Dataset presente na raiz do repositório
     repo_dataset = Path("dataset.jsonl")
     if repo_dataset.exists():
         local_dataset.parent.mkdir(parents=True, exist_ok=True)
@@ -70,11 +42,19 @@ def ensure_dataset(
         LOGGER.info("📥 Copiado dataset do repositório para %s", local_dataset)
         return local_dataset.resolve()
 
-    # 4) Download do GCS
     if storage is None:
         raise RuntimeError(
-            "google-cloud-storage não instalado e dataset não encontrado localmente. "
-            "Instale a dependência ou disponibilize dataset.jsonl."
+            "Dataset não encontrado localmente e google-cloud-storage indisponível. "
+            "Defina LOCAL_DATASET_PATH ou configure o GCS."
+        )
+
+    credentials_present = bool(
+        gcs_config.credentials_path or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    )
+    if not credentials_present:
+        raise RuntimeError(
+            "Dataset não encontrado localmente e credenciais GCS ausentes. "
+            "Defina LOCAL_DATASET_PATH, ajuste GCS_DATASET_PATH ou configure GOOGLE_APPLICATION_CREDENTIALS."
         )
 
     client = storage.Client()  # type: ignore
@@ -93,69 +73,59 @@ def ensure_dataset(
 
 
 def load_dataset(dataset_path: Path) -> Tuple[List[str], List[List[str]]]:
-    """Lê o dataset JSONL e retorna textos e intents.
-
-    Args:
-        dataset_path: Caminho para o arquivo JSONL.
-
-    Returns:
-        Tuple contendo lista de textos e lista de listas de intents.
-    """
     texts: List[str] = []
     intents: List[List[str]] = []
     buffer: List[str] = []
 
-    def process_record(record: Dict) -> None:
-        for message in record.get("messages", []):
+    def process_record(record: Dict[str, object]) -> None:
+        for message in record.get("messages", []):  # type: ignore[assignment]
+            if not isinstance(message, dict):
+                continue
             if message.get("role") != "user":
                 continue
             text = message.get("text")
-            label = message.get("intent") or []
-            if not text or not label:
+            label = message.get("intent")
+            if not isinstance(text, str):
+                continue
+            if not isinstance(label, list) or not label:
                 continue
             texts.append(text)
-            intents.append(label)
+            intents.append([str(item) for item in label])
 
     with dataset_path.open("r", encoding="utf-8") as file:
         for line in file:
             stripped = line.strip()
             if not stripped:
                 continue
-
             try:
                 record = json.loads(stripped)
             except json.JSONDecodeError:
                 buffer.append(line)
                 if stripped == "]}":
-                    record = json.loads("".join(buffer))
-                    process_record(record)
-                    buffer = []
+                    try:
+                        record = json.loads("".join(buffer))
+                        process_record(record)
+                    finally:
+                        buffer = []
                 continue
-            else:
-                process_record(record)
+            process_record(record)
 
     if buffer:
-        raise ValueError("Arquivo JSONL parece incompleto; sobras não processadas encontradas.")
-
+        raise ValueError("Arquivo JSONL parece incompleto; dados residuais encontrados.")
     if not texts:
-        raise ValueError(f"Dataset em {dataset_path} não contém mensagens de usuário válidas.")
+        raise ValueError(f"Dataset em {dataset_path} não contém mensagens válidas.")
 
     return texts, intents
 
 
 def build_label_mappings(intent_lists: Sequence[Sequence[str]]) -> Tuple[Dict[str, int], Dict[int, str]]:
-    """Gera os dicionários intent->id e id->intent."""
     unique_intents = sorted({intent for labels in intent_lists for intent in labels})
     label2id = {intent: idx for idx, intent in enumerate(unique_intents)}
     id2label = {idx: intent for intent, idx in label2id.items()}
     return label2id, id2label
 
 
-def encode_labels(
-    intent_lists: Sequence[Sequence[str]],
-    label2id: Dict[str, int],
-) -> List[List[int]]:
-    """Transforma lista de intents em vetores multi-hot."""
+def encode_labels(intent_lists: Sequence[Sequence[str]], label2id: Dict[str, int]) -> List[List[int]]:
     num_labels = len(label2id)
     encoded: List[List[int]] = []
     for intents in intent_lists:
@@ -174,10 +144,10 @@ def select_indices(
     test_ratio: float,
     seed: int,
 ) -> Tuple[List[int], List[int], List[int]]:
-    """Realiza split reprodutível em train/val/test com fallback quando estratificação falha."""
-    indices = list(range(len(labels)))
     if not abs((train_ratio + val_ratio + test_ratio) - 1.0) < 1e-8:
-        raise ValueError("As proporções de split devem somar 1.0.")
+        raise ValueError("As proporções devem somar 1.0")
+
+    indices = list(range(len(labels)))
 
     def can_stratify(values: Sequence[int]) -> bool:
         counts = Counter(values)
@@ -185,7 +155,7 @@ def select_indices(
 
     stratify = labels if can_stratify(labels) else None
 
-    train_indices, temp_indices = train_test_split(
+    train_idx, temp_idx = train_test_split(
         indices,
         test_size=1 - train_ratio,
         random_state=seed,
@@ -193,47 +163,44 @@ def select_indices(
         stratify=stratify,
     )
 
-    temp_labels = [labels[i] for i in temp_indices]
+    temp_labels = [labels[i] for i in temp_idx]
     remainder = val_ratio + test_ratio
     if remainder <= 0:
-        return train_indices, temp_indices, []
+        return train_idx, temp_idx, []
 
-    val_fraction = val_ratio / remainder
     stratify_temp = temp_labels if can_stratify(temp_labels) else None
 
-    val_indices, test_indices = train_test_split(
-        temp_indices,
-        test_size=1 - val_fraction,
+    val_size = test_ratio / remainder
+    val_idx, test_idx = train_test_split(
+        temp_idx,
+        test_size=val_size,
         random_state=seed,
         shuffle=True,
         stratify=stratify_temp,
     )
+    return train_idx, val_idx, test_idx
 
-    return train_indices, val_indices, test_indices
 
+def slice_encodings(encodings, labels, indices: Sequence[int]):
+    input_ids = [encodings["input_ids"][i] for i in indices]
+    attention = [encodings["attention_mask"][i] for i in indices]
+    label_slice = [labels[i] for i in indices]
 
-def slice_encodings(
-    encodings: Dict[str, Sequence[Sequence[int]]],
-    labels: Sequence[int],
-    indices: Sequence[int],
-) -> Tuple[Dict[str, List[Sequence[int]]], List[int]]:
-    """Seleciona subconjuntos dos encodings e rótulos a partir dos índices informados."""
-    subset_encodings = {key: [val[i] for i in indices] for key, val in encodings.items()}
-    subset_labels = [labels[i] for i in indices]
-    return subset_encodings, subset_labels
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention,
+    }, label_slice
 
 
 class IntentDataset(Dataset):
-    """Wrapper Dataset compatível com o HuggingFace Trainer."""
-
-    def __init__(self, encodings: Dict[str, Sequence[Sequence[int]]], labels: Sequence[Sequence[int]]):
+    def __init__(self, encodings, labels) -> None:
         self.encodings = encodings
         self.labels = labels
 
     def __len__(self) -> int:
         return len(self.labels)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int):
         item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
-        item["labels"] = torch.tensor(self.labels[idx], dtype=torch.float32)
+        item["labels"] = torch.tensor(self.labels[idx]).float()
         return item

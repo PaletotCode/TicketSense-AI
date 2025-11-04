@@ -1,8 +1,5 @@
 """
-Pipeline de treinamento do modelo de intenções do PingFy_IA.
-
-Executa o fine-tuning do DistilBERT utilizando MPS (quando disponível),
-salvando artefatos em ``artifacts/`` e retornando métricas de validação.
+Pipeline de treinamento do modelo de intenções.
 """
 
 from __future__ import annotations
@@ -14,11 +11,7 @@ from typing import Dict
 
 import torch
 from sklearn.metrics import f1_score, precision_score, recall_score
-from transformers import (
-    DataCollatorWithPadding,
-    Trainer,
-    TrainingArguments,
-)
+from transformers import DataCollatorWithPadding, Trainer, TrainingArguments
 
 from config.config import DEVICE, gcs_config, model_config, training_config
 from trainer.dataset_utils import (
@@ -30,18 +23,11 @@ from trainer.dataset_utils import (
     select_indices,
     slice_encodings,
 )
-from trainer.model_utils import (
-    create_model,
-    create_tokenizer,
-    maybe_upload_to_gcs,
-    save_label_map,
-)
+from trainer.model_utils import create_model, create_tokenizer, maybe_upload_to_gcs, save_label_map
 
-# Ajustes de ambiente para MPS e tokenizers
 os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-# Logging configurado para console + arquivo em artifacts/logs
 LOG_FILE = training_config.logs_dir / "training.log"
 logging.basicConfig(
     level=logging.INFO,
@@ -55,7 +41,6 @@ LOGGER = logging.getLogger("trainer")
 
 
 def compute_metrics(eval_preds) -> Dict[str, float]:
-    """Callback de métricas para classificação multi-label."""
     logits, labels = eval_preds
     probabilities = torch.sigmoid(torch.from_numpy(logits))
     preds = (probabilities >= 0.5).int()
@@ -65,7 +50,6 @@ def compute_metrics(eval_preds) -> Dict[str, float]:
             preds[i, top_idx] = 1
     preds_np = preds.numpy()
     labels_np = torch.from_numpy(labels).int().numpy()
-
     subset_accuracy = (preds_np == labels_np).all(axis=1).mean()
     precision = precision_score(labels_np, preds_np, average="micro", zero_division=0)
     recall = recall_score(labels_np, preds_np, average="micro", zero_division=0)
@@ -79,7 +63,6 @@ def compute_metrics(eval_preds) -> Dict[str, float]:
 
 
 def run_training() -> Dict[str, float]:
-    """Executa o ciclo completo de treinamento."""
     dataset_path = ensure_dataset(gcs_config=gcs_config, training_config=training_config)
     texts, intent_lists = load_dataset(dataset_path)
     label2id, id2label = build_label_mappings(intent_lists)
@@ -114,8 +97,6 @@ def run_training() -> Dict[str, float]:
     best_model_dir = training_config.best_model_dir
     logging_dir = training_config.logs_dir / "trainer"
     logging_dir.mkdir(parents=True, exist_ok=True)
-
-    model.gradient_checkpointing_enable()
 
     training_args = TrainingArguments(
         output_dir=str(output_dir),
@@ -168,7 +149,6 @@ def run_training() -> Dict[str, float]:
 
 
 def main() -> Dict[str, float]:
-    """Ponto de entrada padrão para execução via ``python -m trainer.train``."""
     metrics = run_training()
     LOGGER.info("🏁 Pipeline finalizado com métricas: %s", metrics)
     return metrics

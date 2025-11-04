@@ -1,7 +1,3 @@
-"""
-Esquemas Pydantic utilizados pela API de inferência do PingFy_IA.
-"""
-
 from __future__ import annotations
 
 from typing import Dict, List, Optional
@@ -10,69 +6,38 @@ from pydantic import BaseModel, Field
 
 
 class PredictionRequest(BaseModel):
-    """Payload para predição unitária."""
-
-    text: str = Field(..., min_length=1, max_length=500, description="Texto da mensagem do usuário")
-    return_probabilities: bool = Field(
-        default=False,
-        description="Retornar probabilidades de todas as classes",
-    )
-
-    model_config = {
-        "json_schema_extra": {
-            "example": {
-                "text": "Bom dia, o boleto deste mês não chegou no meu email. Poderia reenviar?",
-                "return_probabilities": False,
-            }
-        }
-    }
+    text: str
+    return_probabilities: bool = False
 
 
-class IntentPrediction(BaseModel):
-    """Resposta com a intenção classificada."""
-
-    intent: str = Field(..., description="Intenção predita")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Confiança (0-1)")
-    all_probabilities: Optional[Dict[str, float]] = Field(
-        default=None,
-        description="Probabilidades de todas as classes",
-    )
-
-    model_config = {
-        "json_schema_extra": {
-            "example": {
-                "intent": "PAYMENT",
-                "confidence": 0.9823,
-                "all_probabilities": None,
-            }
-        }
-    }
+class BatchItem(BaseModel):
+    text: str
+    return_probabilities: bool = False
 
 
 class BatchPredictionRequest(BaseModel):
-    """Payload para predições em lote."""
+    items: List[BatchItem]
 
-    texts: List[str] = Field(
-        ...,
-        min_length=1,
-        max_length=100,
-        description="Lista de textos para classificação",
-    )
+
+class IntentScore(BaseModel):
+    label: str
+    score: float
+
+
+class IntentPrediction(BaseModel):
+    intent: str
+    confidence: float
+    intents: List[IntentScore] = Field(default_factory=list)
+    all_probabilities: Optional[Dict[str, float]] = None
 
 
 class HealthResponse(BaseModel):
-    """Resposta do health check."""
-
     status: str
-    model_loaded: bool
     device: str
 
 
 class ModelInfo(BaseModel):
-    """Informações sobre o modelo carregado."""
-
     model_name: str
-    num_labels: int
-    intent_classes: List[str]
-    max_seq_length: int
+    intents: Dict[str, int]
+    max_length: int
     device: str
