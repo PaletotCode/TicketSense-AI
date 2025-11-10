@@ -5,7 +5,7 @@ DATASET := data/synthetic_dataset_v2.jsonl
 MODEL := gemini-2.0-flash-lite
 BATCH := 50
 
-.PHONY: env dataset resume validate train eval api quality clean
+.PHONY: env dataset resume validate train eval api quality clean dedupe
 
 env:
 	python3 -m venv venv && source venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt
@@ -40,12 +40,26 @@ quality:
 
 train:
 	LOCAL_DATASET_PATH=$(DATASET) $(PYTHON) -m trainer.train
+	$(PYTHON) scripts/utils/dataset_deduper.py \
+		--input $(DATASET) \
+		--output $(DATASET) \
+		--client gemini \
+		--model $(MODEL) \
+		--batch-size 12
 
 eval:
 	$(PYTHON) scripts/evaluate_model.py --threshold 0.4 --topk 3
 
 api:
 	$(PYTHON) -m uvicorn api.inference:app --reload --port 8000
+
+dedupe:
+	$(PYTHON) scripts/utils/dataset_deduper.py \
+		--input $(DATASET) \
+		--output $(DATASET) \
+		--client gemini \
+		--model $(MODEL) \
+		--batch-size 12
 
 clean:
 	rm -rf venv __pycache__ artifacts/checkpoints/*

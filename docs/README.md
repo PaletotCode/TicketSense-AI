@@ -77,10 +77,14 @@ pip install -r requirements.txt
 Coloque na raiz (`.env`):
 ```env
 GEMINI_API_KEY=seu_token
+# OU use GEMINI_API_KEY_1, GEMINI_API_KEY_2, GEMINI_API_KEY_3 para failover
+# ou GEMINI_API_KEYS=token_a,token_b,token_c
 OPENAI_API_KEY=opcional
 GCS_BUCKET_NAME=pingfy-dataset
 GCS_DATASET_PATH=data/synthetic_dataset.jsonl
 ```
+Quando mais de uma chave Gemini é fornecida, o gerador de dataset alterna automaticamente ao detectar erros de conexão ou limite excedido.
+
 Se precisar de GCS upload: `GOOGLE_APPLICATION_CREDENTIALS=/caminho/para/service-account.json`.
 
 ---
@@ -99,6 +103,7 @@ O `Makefile` padroniza os passos. A tabela abaixo resume:
 | `make train` | Treino completo (`LOCAL_DATASET_PATH=...`) |
 | `make eval` | Avaliação (`evaluate_model.py --threshold 0.4`) |
 | `make api` | Sobe FastAPI com reload |
+| `make dedupe` | Reescreve duplicatas via Gemini até zerar |
 | `make clean` | Remove venv/checkpoints (cautela) |
 
 Fluxo típico (end-to-end):
@@ -127,6 +132,10 @@ Fluxo típico (end-to-end):
   - CLI com `--resume`, `--analysis`, logging e validação.  
   - `get_client` usa `GeminiClient` (`gemini-2.0-flash-lite`) por padrão.  
   - Salva incrementalmente e retoma facilmente.
+- **dataset_deduper.py**:  
+  - Pipeline de pós-treino/pós-geração que calcula duplicatas textuais e envia lotes para o Gemini reescrever mantendo as intents.  
+  - Somente frases inéditas são aceitas; se a resposta ainda duplicar algo existente, o item volta para a fila e é reprocessado até a duplicata sumir.  
+  - Integrado ao `make train` (executa ao final) e disponível via `make dedupe` para rodadas manuais antes de um novo ciclo de treino.
 - **generation_utils.py**: prompt padrão, parser incremental (`iter_json_objects`), validação de sample.
 - **llm_clients.py**:  
   - `GeminiClient`, `OpenAIClient`, `MockClient`.  

@@ -8,7 +8,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# `__file__` está em scripts/utils/, então o raiz fica dois níveis acima.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -137,17 +138,24 @@ def run_generation_pipeline(
                     json.dumps(task.intents, ensure_ascii=False),
                     task.count,
                 )
-                batches = math.ceil(task.count / batch_size)
                 generated_for_task = 0
+                total_batches = math.ceil(task.count / batch_size)  # usado apenas para logging
+                batch_number = 0
 
-                for batch_number in range(batches):
+                while generated_for_task < task.count:
+                    batch_number += 1
                     remaining = task.count - generated_for_task
                     current_batch = min(batch_size, remaining)
-                    if current_batch <= 0:
-                        continue
-                    LOGGER.debug("  Lote %d/%d: solicitando %d amostras", batch_number + 1, batches, current_batch)
+                    LOGGER.debug(
+                        "  Lote %d/%d: solicitando %d amostras (faltam %d)",
+                        batch_number,
+                        total_batches,
+                        current_batch,
+                        remaining,
+                    )
 
                     attempt = 0
+                    success = False
                     while attempt < max_retries:
                         attempt += 1
                         try:
@@ -176,14 +184,14 @@ def run_generation_pipeline(
                             stats["total_generated"] += batch_valid
                             pbar.update(batch_valid)
                             LOGGER.debug(
-                                "  Lote %d/%d concluído: %d válidas, %d inválidas (acumulado tarefa: %d/%d)",
-                                batch_number + 1,
-                                batches,
+                                "  Lote %d concluído: %d válidas, %d inválidas (acumulado tarefa: %d/%d)",
+                                batch_number,
                                 batch_valid,
                                 invalid,
                                 generated_for_task,
                                 task.count,
                             )
+                            success = True
                             break
                         except Exception as exc:
                             stats["total_retries"] += 1
@@ -194,7 +202,13 @@ def run_generation_pipeline(
                                 exc,
                             )
                             if attempt == max_retries:
-                                LOGGER.error("  ❌ Lote descartado após %d tentativas.", max_retries)
+                                LOGGER.error(
+                                    "  ❌ Lote abortado após %d tentativas; %d amostras ainda faltam para esta tarefa.",
+                                    max_retries,
+                                    task.count - generated_for_task,
+                                )
+                    if not success:
+                        break
 
                 LOGGER.info("[Tarefa %d/%d] finalizada: %d/%d amostras.", task_idx, len(recipe), generated_for_task, task.count)
 
