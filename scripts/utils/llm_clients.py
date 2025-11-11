@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -89,6 +91,10 @@ class GeminiClient(LLMClient):
         self.max_output_tokens = max_output_tokens
         self.api_keys = self._resolve_api_keys(api_key)
         self._current_key_index = 0
+        self.requests_per_minute = int(os.getenv("GEMINI_REQUESTS_PER_MINUTE", "15"))
+        self._min_interval = 60.0 / self.requests_per_minute if self.requests_per_minute > 0 else 0.0
+        self._key_last_call = [0.0 for _ in self.api_keys]
+        self._max_attempts_per_key = max(1, int(os.getenv("GEMINI_MAX_ATTEMPTS_PER_KEY", "2")))
         self._configure_client()
 
         LOGGER.info(
@@ -125,6 +131,24 @@ class GeminiClient(LLMClient):
         self._genai.configure(api_key=current_key)
         self.model = self._genai.GenerativeModel(model_name=self.model_name)
 
+    def _respect_rate_limit(self) -> None:
+        if self._min_interval <= 0:
+            return
+        idx = self._current_key_index
+        last_call = self._key_last_call[idx]
+        elapsed = time.monotonic() - last_call
+        wait_time = self._min_interval - elapsed
+        if wait_time > 0:
+            LOGGER.debug(
+                "Aguardando %.2fs para respeitar rate limit da chave #%d",
+                wait_time,
+                idx + 1,
+            )
+            time.sleep(wait_time)
+
+    def _mark_call_complete(self) -> None:
+        self._key_last_call[self._current_key_index] = time.monotonic()
+
     def _rotate_key(self) -> bool:
         if self._current_key_index + 1 >= len(self.api_keys):
             return False
@@ -133,9 +157,26 @@ class GeminiClient(LLMClient):
         self._configure_client()
         return True
 
+    def _advance_key_after_success(self) -> None:
+        if len(self.api_keys) <= 1:
+            return
+        self._current_key_index = (self._current_key_index + 1) % len(self.api_keys)
+        self._configure_client()
+
     def _current_key_label(self) -> str:
         suffix = self.api_keys[self._current_key_index]
         return f"...{suffix[-4:]}" if len(suffix) >= 4 else "***"
+
+    @staticmethod
+    def _extract_retry_delay(exc: Exception) -> Optional[float]:
+        message = str(exc)
+        match = re.search(r"retry in (\d+(?:\.\d+)?)s", message, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                return None
+        return None
 
     def generate(self, prompt: str) -> str:
         if not prompt.strip():
@@ -156,29 +197,43 @@ class GeminiClient(LLMClient):
             return getattr(response, "text", "") or ""
 
         attempts_with_keys = 0
+        attempts_current_key = 0
         while attempts_with_keys < len(self.api_keys):
             try:
-                return _call_model()
+                self._respect_rate_limit()
+                result = _call_model()
+                self._mark_call_complete()
+                self._advance_key_after_success()
+                return result
             except Exception as exc:
                 LOGGER.error(
-                    "Erro ao chamar Gemini com chave #%d (%s): %s. Tentando recarregar modelo.",
+                    "Erro ao chamar Gemini com chave #%d (%s): %s.",
                     self._current_key_index + 1,
                     self._current_key_label(),
                     exc,
                     exc_info=True,
                 )
+                retry_delay = self._extract_retry_delay(exc)
+                if retry_delay:
+                    LOGGER.warning("⏱️  Rate limit atingido; aguardando %.2fs antes de tentar novamente.", retry_delay)
+                    time.sleep(min(retry_delay, 120))
                 try:
-                    self._configure_client()  # recarrega com a mesma chave antes de alternar
-                    return _call_model()
+                    self._configure_client()
                 except Exception as reload_exc:
                     LOGGER.error(
-                        "Falha após recarregar modelo com chave #%d: %s",
+                        "Falha ao reconfigurar chave #%d: %s",
                         self._current_key_index + 1,
                         reload_exc,
                         exc_info=True,
                     )
+                    attempts_current_key = self._max_attempts_per_key
+                else:
+                    attempts_current_key += 1
+                    if attempts_current_key < self._max_attempts_per_key:
+                        continue
 
                 attempts_with_keys += 1
+                attempts_current_key = 0
                 if not self._rotate_key():
                     break
                 LOGGER.info(

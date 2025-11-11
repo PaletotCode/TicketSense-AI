@@ -2,10 +2,10 @@ SHELL := /bin/bash
 PYTHON := source venv/bin/activate && python
 
 DATASET := data/synthetic_dataset_v2.jsonl
-MODEL := gemini-2.0-flash-lite
+MODEL := gemini-2.5-flash-lite
 BATCH := 50
 
-.PHONY: env dataset resume validate train eval api quality clean dedupe
+.PHONY: env dataset resume validate train eval api quality clean dedupe dedupe-resume
 
 env:
 	python3 -m venv venv && source venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt
@@ -61,5 +61,17 @@ dedupe:
 		--model $(MODEL) \
 		--batch-size 12
 
+dedupe-resume:
+	$(PYTHON) scripts/utils/dataset_deduper.py \
+		--input $(DATASET) \
+		--output $(DATASET) \
+		--client gemini \
+		--model $(MODEL) \
+		--batch-size 12 \
+		--resume
+
 clean:
 	rm -rf venv __pycache__ artifacts/checkpoints/*
+
+venv:
+	source venv/bin/activate

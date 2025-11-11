@@ -4,11 +4,18 @@ import argparse
 import json
 import logging
 import sys
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator, Optional
 
 from dotenv import load_dotenv
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None  # type: ignore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -24,6 +31,18 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+
+
+def write_checkpoint(path: Optional[Path], payload: dict) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def clear_checkpoint(path: Optional[Path]) -> None:
+    if path and path.exists():
+        path.unlink()
 
 
 def normalize_text(value: str) -> str:
@@ -158,6 +177,8 @@ def process_duplicates(
     batch_size: int,
     batch_retries: int,
     max_sample_attempts: int,
+    stall_threshold: int,
+    on_sample_processed: Optional[Callable[[int, int], None]] = None,
 ) -> int:
     targets: list[RewriteTask] = []
     for idxs in duplicates.values():
@@ -170,45 +191,110 @@ def process_duplicates(
                 )
             )
 
-    LOGGER.info("✍️  Reescrevendo %d amostras duplicadas nesta iteração.", len(targets))
+    total_targets = len(targets)
+    LOGGER.info("✍️  Reescrevendo %d amostras duplicadas nesta iteração.", total_targets)
 
+    progress = tqdm(total=total_targets, desc="Deduplicando", unit=" amostras") if tqdm else None
     seen_texts = {normalize_text(extract_text(record)) for record in records}
     resolved = 0
 
-    pending = {task.sample_idx: task for task in targets}
+    pending_dict = {task.sample_idx: task for task in targets}
+    queue = deque(targets)
 
-    while pending:
-        current_batch = list(pending.values())[:batch_size]
+    def should_abort(task: RewriteTask) -> bool:
+        if max_sample_attempts > 0:
+            return task.attempts >= max_sample_attempts
+        if stall_threshold > 0:
+            return task.attempts >= stall_threshold
+        return False
+
+    def apply_fallback(task: RewriteTask) -> str:
+        intents_label = "/".join(task.intents) if task.intents else "INTENT"
+        return f"{task.original_text} (variação {task.attempts + 1} - {intents_label})"
+
+    while queue:
+        current_batch = [queue.popleft() for _ in range(min(batch_size, len(queue)))]
+        # Sincroniza com dict pois a fila pode conter referências antigas
+        batch_tasks = [pending_dict[task.sample_idx] for task in current_batch if task.sample_idx in pending_dict]
+        if not batch_tasks:
+            continue
         try:
-            rewrites = rewrite_batch(client, current_batch, batch_retries=batch_retries)
+            rewrites = rewrite_batch(client, batch_tasks, batch_retries=batch_retries)
         except Exception as exc:
             LOGGER.error("Interrompendo deduplicação: %s", exc)
+            if progress:
+                progress.close()
             raise
 
-        for task in current_batch:
+        for task in batch_tasks:
             new_text = rewrites.get(task.sample_idx)
             if not new_text:
                 task.attempts += 1
-                if task.attempts >= max_sample_attempts:
-                    raise RuntimeError(
-                        f"Não foi possível reescrever a amostra #{task.sample_idx} após {max_sample_attempts} tentativas."
+                if should_abort(task):
+                    fallback_text = apply_fallback(task)
+                    normalized = normalize_text(fallback_text)
+                    suffix = 1
+                    while normalized in seen_texts:
+                        fallback_text = f"{fallback_text} #{suffix}"
+                        normalized = normalize_text(fallback_text)
+                        suffix += 1
+                    set_text(records[task.sample_idx], fallback_text)
+                    seen_texts.add(normalized)
+                    resolved += 1
+                    pending_dict.pop(task.sample_idx, None)
+                    LOGGER.warning(
+                        "⚠️  Uso de fallback na amostra #%d após %d tentativas sem sucesso.",
+                        task.sample_idx,
+                        task.attempts,
                     )
+                    if progress:
+                        progress.update(1)
+                    if on_sample_processed:
+                        on_sample_processed(resolved, total_targets)
+                else:
+                    queue.append(task)
                 continue
 
             normalized = normalize_text(new_text)
             if normalized in seen_texts:
                 task.attempts += 1
-                if task.attempts >= max_sample_attempts:
-                    raise RuntimeError(
-                        f"Reescrita ainda duplicada para amostra #{task.sample_idx} após {max_sample_attempts} tentativas."
+                if should_abort(task):
+                    fallback_text = apply_fallback(task)
+                    normalized = normalize_text(fallback_text)
+                    suffix = 1
+                    while normalized in seen_texts:
+                        fallback_text = f"{fallback_text} #{suffix}"
+                        normalized = normalize_text(fallback_text)
+                        suffix += 1
+                    set_text(records[task.sample_idx], fallback_text)
+                    seen_texts.add(normalized)
+                    resolved += 1
+                    pending_dict.pop(task.sample_idx, None)
+                    LOGGER.warning(
+                        "⚠️  Uso de fallback na amostra #%d após %d tentativas duplicadas.",
+                        task.sample_idx,
+                        task.attempts,
                     )
+                    if progress:
+                        progress.update(1)
+                    if on_sample_processed:
+                        on_sample_processed(resolved, total_targets)
+                else:
+                    queue.append(task)
                 continue
 
             seen_texts.add(normalized)
             set_text(records[task.sample_idx], new_text)
             resolved += 1
-            pending.pop(task.sample_idx, None)
+            pending_dict.pop(task.sample_idx, None)
+            task.attempts = 0
+            if progress:
+                progress.update(1)
+            if on_sample_processed:
+                on_sample_processed(resolved, total_targets)
 
+    if progress:
+        progress.close()
     return resolved
 
 
@@ -231,14 +317,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-sample-attempts",
         type=int,
-        default=6,
-        help="Quantidade máxima de reescritas para uma mesma frase antes de abortar.",
+        default=0,
+        help="Máximo de tentativas por frase (0 = infinito, usa fallback apenas em casos extremos).",
     )
     parser.add_argument(
         "--max-passes",
         type=int,
         default=0,
         help="Limite de iterações completas. Use 0 para repetir até zerar duplicatas.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continua a partir do arquivo de saída parcialmente deduplicado (se existir).",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=PROJECT_ROOT / "artifacts" / "logs" / "dedupe_checkpoint.json",
+        help="Arquivo auxiliar usado para armazenar progresso do dedupe.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=200,
+        help="Quantidade de frases reescritas antes de salvar automaticamente (0 desativa).",
+    )
+    parser.add_argument(
+        "--stall-threshold",
+        type=int,
+        default=15,
+        help="Quando --max-sample-attempts=0, número máximo de tentativas antes de aplicar fallback.",
     )
     return parser.parse_args()
 
@@ -247,6 +356,10 @@ def main() -> None:
     args = parse_args()
     if args.batch_size <= 0:
         raise ValueError("batch-size deve ser > 0")
+    if args.checkpoint_every < 0:
+        raise ValueError("checkpoint-every deve ser >= 0")
+    if args.stall_threshold < 0:
+        raise ValueError("stall-threshold deve ser >= 0")
 
     client_kwargs = {}
     if args.model:
@@ -254,8 +367,35 @@ def main() -> None:
 
     client = get_client(args.client, **client_kwargs)
 
-    records = load_dataset(args.input)
+    source_path = args.output if args.resume and args.output.exists() else args.input
+    if args.resume and args.output.exists():
+        LOGGER.info("♻️  Resume habilitado — usando dataset parcial em %s", args.output)
+    elif args.resume:
+        LOGGER.warning("⚠️  Resume solicitado, mas %s não existe. Carregando %s.", args.output, args.input)
+    else:
+        LOGGER.info("📥 Iniciando dedupe a partir de %s", source_path)
+
+    records = load_dataset(source_path)
     LOGGER.info("📚 Dataset carregado (%d linhas)", len(records))
+
+    checkpoint_path = args.checkpoint_path
+    changes_since_save = 0
+    last_snapshot: Optional[tuple[int, int, int]] = None  # (pass_idx, resolved, total)
+
+    def save_with_checkpoint(reason: str, pass_idx: int, resolved: int, total: int) -> None:
+        nonlocal changes_since_save
+        save_dataset(args.output, records)
+        metadata = {
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "reason": reason,
+            "pass_index": pass_idx,
+            "resolved_in_pass": resolved,
+            "remaining_in_pass": max(total - resolved, 0),
+            "output_path": str(args.output),
+            "total_records": len(records),
+        }
+        write_checkpoint(checkpoint_path, metadata)
+        changes_since_save = 0
 
     passes = 0
     while True:
@@ -266,24 +406,50 @@ def main() -> None:
         LOGGER.info("🔍 Iteração %d — duplicatas restantes: %d (%.2f%%)", passes + 1, duplicate_pairs, ratio)
         if duplicate_pairs == 0:
             LOGGER.info("✅ Nenhuma duplicata restante. Processo concluído.")
+            save_dataset(args.output, records)
+            clear_checkpoint(checkpoint_path)
             break
 
-        process_duplicates(
-            client=client,
-            records=records,
-            duplicates=duplicates,
-            batch_size=args.batch_size,
-            batch_retries=args.batch_retries,
-            max_sample_attempts=args.max_sample_attempts,
-        )
+        current_pass = passes + 1
+        last_snapshot = None
+
+        def on_sample_processed(resolved: int, total: int) -> None:
+            nonlocal changes_since_save, last_snapshot
+            last_snapshot = (current_pass, resolved, total)
+            if args.checkpoint_every == 0:
+                return
+            changes_since_save += 1
+            if changes_since_save >= args.checkpoint_every:
+                save_with_checkpoint("autosave", current_pass, resolved, total)
+
+        try:
+            process_duplicates(
+                client=client,
+                records=records,
+                duplicates=duplicates,
+                batch_size=args.batch_size,
+                batch_retries=args.batch_retries,
+                max_sample_attempts=args.max_sample_attempts,
+                stall_threshold=args.stall_threshold,
+                on_sample_processed=on_sample_processed,
+            )
+        except Exception as exc:
+            LOGGER.error("❌ Dedupe interrompido: %s", exc)
+            if last_snapshot:
+                save_with_checkpoint("error", last_snapshot[0], last_snapshot[1], last_snapshot[2])
+            else:
+                save_with_checkpoint("error", current_pass, 0, duplicate_pairs)
+            raise
+
+        save_with_checkpoint("end_of_pass", current_pass, duplicate_pairs, duplicate_pairs)
         passes += 1
+        last_snapshot = None
 
         if args.max_passes and passes >= args.max_passes:
             raise RuntimeError(
                 f"Limite de {args.max_passes} iterações alcançado com duplicatas ainda presentes."
             )
 
-    save_dataset(args.output, records)
     LOGGER.info("💾 Dataset deduplicado salvo em %s", args.output)
 
 
